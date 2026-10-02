@@ -139,90 +139,8 @@ logger = logging.get_logger(__name__)
 # ======================================================================
 
 
-# ── MTP (multi-token prediction) ─────────────────────────────────────────────
-def _mtp_loss_weight(text_config):
-    """Resolve the MTP loss weight, or None when MTP is disabled."""
-    weight = getattr(text_config, "mtp_loss_weight", None)
-    if weight is None:
-        return None
-    weight = float(weight)
-    if weight <= 0.0:
-        return None
-    if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
-        return None
-    return weight
-
-
-def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
-    """Compute one token-normalized loss over all MTP depths."""
-    if mtp_labels.ndim != 3:
-        raise ValueError(
-            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
-        )
-    if len(hidden_states) != mtp_labels.shape[1]:
-        raise ValueError(
-            "MTP hidden-state depth must match the label depth; "
-            f"got {len(hidden_states)} hidden-state row(s) and {mtp_labels.shape[1]} label row(s)."
-        )
-
-    batch_size, num_depths, sequence_length = mtp_labels.shape
-    stacked_hidden_states = torch.stack(hidden_states, dim=1)
-    flat_hidden_states = stacked_hidden_states.reshape(batch_size * num_depths, sequence_length, -1)
-    flat_labels = mtp_labels.reshape(batch_size * num_depths, sequence_length)
-
-    valid_target_count = (flat_labels != IGNORE_INDEX).sum()  # noqa: F821
-    has_valid_target = valid_target_count > 0
-    safe_labels = flat_labels.clone()
-    safe_labels.reshape(-1)[0] = torch.where(
-        has_valid_target,
-        safe_labels.reshape(-1)[0],
-        safe_labels.new_zeros(()),
-    )
-
-    loss_kwargs = dict(kwargs)
-    loss_kwargs.pop("shift_labels", None)
-    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
-    mtp_loss, _, _ = mtp_loss_fn(
-        logits=None,
-        labels=safe_labels,
-        vocab_size=vocab_size,
-        hidden_states=flat_hidden_states,
-        weights=weights,
-        shift_labels=safe_labels,
-        **loss_kwargs,
-    )
-    return mtp_loss * has_valid_target.to(mtp_loss.dtype)
-
-
-def mm_token_type_ids_from_input_ids(input_ids, config):
-    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
-    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
-    # it; VeOmni's data pipeline carries modality only via the multimodal
-    # token ids inside `input_ids`, so derive the type ids from those here.
-    # `config` selects the token-id namespace and must match `input_ids`: the
-    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
-    # config in the `get_position_id` precompute path. Do not unify the two
-    # call sites onto one config.
-    mm_token_type_ids = torch.zeros_like(input_ids)
-    mm_token_type_ids[input_ids == config.image_token_id] = 1
-    mm_token_type_ids[input_ids == config.video_token_id] = 2
-    return mm_token_type_ids
-
-
-def get_position_id(main_func, self, **kwargs):
-    # Must be a module-level function for multiprocessing pickle
-    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
-    # `input_ids` when the data pipeline did not pass it explicitly.
-    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
-        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
-            kwargs["input_ids"], self.config
-        )
-    position_ids, rope_deltas = main_func(self, **kwargs)
-    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
-
-
 def collate_multimodal_metadata(batch, sp_pad):
-    """Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT.
+    """Derive ``multimodal_metadata`` for the Qwen3-VL-family ViT.
 
     Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
     collator as a picklable callable (mirrors ``get_position_id``). Runs
@@ -242,11 +160,11 @@ def collate_multimodal_metadata(batch, sp_pad):
     # the collator runs in dataloader workers, no host-device sync.
     # Temporal unroll: each (t, h, w) expands to ``t`` cu steps of ``h * w``.
     if "pixel_values_merged" in batch:
-        # The pre-slice hook (`merge_pixel_streams`) replaced the raw
-        # pixel streams with one merged stream (image rows first, then video
-        # rows): emit ONE cu_seqlens over image frames then video frames,
-        # with a single sp-pad tail, plus the global image patch-row count
-        # Model.forward needs to split the gathered feature stream.
+        # The pre-slice hook (`merge_pixel_streams`) replaced the raw pixel
+        # streams with one merged stream (image rows first, then video rows):
+        # emit ONE cu_seqlens over image frames then video frames, with a
+        # single sp-pad tail (zero when SP is off), plus the global image
+        # patch-row count Model.forward needs to split the feature stream.
         merged_grid_list = []
         cu = [0]
         max_hw = 0
@@ -333,6 +251,88 @@ def merge_pixel_streams(batch):
     if not streams:
         return
     batch["pixel_values_merged"] = torch.cat(streams, dim=0) if len(streams) > 1 else streams[0]
+
+
+# ── MTP (multi-token prediction) ─────────────────────────────────────────────
+def _mtp_loss_weight(text_config):
+    """Resolve the MTP loss weight, or None when MTP is disabled."""
+    weight = getattr(text_config, "mtp_loss_weight", None)
+    if weight is None:
+        return None
+    weight = float(weight)
+    if weight <= 0.0:
+        return None
+    if int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0) <= 0:
+        return None
+    return weight
+
+
+def compute_mtp_loss(mtp_loss_fn, hidden_states, mtp_labels, weights, vocab_size, **kwargs):
+    """Compute one token-normalized loss over all MTP depths."""
+    if mtp_labels.ndim != 3:
+        raise ValueError(
+            f"MTP labels must have shape [batch, depth, sequence]; got mtp_labels.shape={tuple(mtp_labels.shape)}."
+        )
+    if len(hidden_states) != mtp_labels.shape[1]:
+        raise ValueError(
+            "MTP hidden-state depth must match the label depth; "
+            f"got {len(hidden_states)} hidden-state row(s) and {mtp_labels.shape[1]} label row(s)."
+        )
+
+    batch_size, num_depths, sequence_length = mtp_labels.shape
+    stacked_hidden_states = torch.stack(hidden_states, dim=1)
+    flat_hidden_states = stacked_hidden_states.reshape(batch_size * num_depths, sequence_length, -1)
+    flat_labels = mtp_labels.reshape(batch_size * num_depths, sequence_length)
+
+    valid_target_count = (flat_labels != IGNORE_INDEX).sum()  # noqa: F821
+    has_valid_target = valid_target_count > 0
+    safe_labels = flat_labels.clone()
+    safe_labels.reshape(-1)[0] = torch.where(
+        has_valid_target,
+        safe_labels.reshape(-1)[0],
+        safe_labels.new_zeros(()),
+    )
+
+    loss_kwargs = dict(kwargs)
+    loss_kwargs.pop("shift_labels", None)
+    loss_kwargs["num_items_in_batch"] = valid_target_count.clamp_min(1)
+    mtp_loss, _, _ = mtp_loss_fn(
+        logits=None,
+        labels=safe_labels,
+        vocab_size=vocab_size,
+        hidden_states=flat_hidden_states,
+        weights=weights,
+        shift_labels=safe_labels,
+        **loss_kwargs,
+    )
+    return mtp_loss * has_valid_target.to(mtp_loss.dtype)
+
+
+def mm_token_type_ids_from_input_ids(input_ids, config):
+    # transformers v5 VLMs require `mm_token_type_ids` to compute multimodal
+    # RoPE (M-RoPE): text=0, image=1, video=2 per token. HF's processor emits
+    # it; VeOmni's data pipeline carries modality only via the multimodal
+    # token ids inside `input_ids`, so derive the type ids from those here.
+    # `config` selects the token-id namespace and must match `input_ids`: the
+    # live model config on the `forward` path, the IMAGE/VIDEO_INPUT_INDEX fake
+    # config in the `get_position_id` precompute path. Do not unify the two
+    # call sites onto one config.
+    mm_token_type_ids = torch.zeros_like(input_ids)
+    mm_token_type_ids[input_ids == config.image_token_id] = 1
+    mm_token_type_ids[input_ids == config.video_token_id] = 2
+    return mm_token_type_ids
+
+
+def get_position_id(main_func, self, **kwargs):
+    # Must be a module-level function for multiprocessing pickle
+    # v5 `get_rope_index` requires `mm_token_type_ids`; derive it from
+    # `input_ids` when the data pipeline did not pass it explicitly.
+    if kwargs.get("mm_token_type_ids") is None and kwargs.get("input_ids") is not None:
+        kwargs["mm_token_type_ids"] = mm_token_type_ids_from_input_ids(  # noqa: F821 defined via add_helper
+            kwargs["input_ids"], self.config
+        )
+    position_ids, rope_deltas = main_func(self, **kwargs)
+    return {"position_ids": position_ids, "rope_deltas": rope_deltas}
 
 
 # ================================================================

@@ -213,7 +213,7 @@
 +
 +
 +def collate_multimodal_metadata(batch, sp_pad):
-+    """Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT.
++    """Derive ``multimodal_metadata`` for the Qwen3-VL-family ViT.
 +
 +    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
 +    collator as a picklable callable (mirrors ``get_position_id``). Runs
@@ -233,11 +233,11 @@
 +    # the collator runs in dataloader workers, no host-device sync.
 +    # Temporal unroll: each (t, h, w) expands to ``t`` cu steps of ``h * w``.
 +    if "pixel_values_merged" in batch:
-+        # The pre-slice hook (`merge_pixel_streams`) replaced the raw
-+        # pixel streams with one merged stream (image rows first, then video
-+        # rows): emit ONE cu_seqlens over image frames then video frames,
-+        # with a single sp-pad tail, plus the global image patch-row count
-+        # Model.forward needs to split the gathered feature stream.
++        # The pre-slice hook (`merge_pixel_streams`) replaced the raw pixel
++        # streams with one merged stream (image rows first, then video rows):
++        # emit ONE cu_seqlens over image frames then video frames, with a
++        # single sp-pad tail (zero when SP is off), plus the global image
++        # patch-row count Model.forward needs to split the feature stream.
 +        merged_grid_list = []
 +        cu = [0]
 +        max_hw = 0
