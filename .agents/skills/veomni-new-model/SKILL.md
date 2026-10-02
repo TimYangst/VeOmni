@@ -112,7 +112,10 @@ Come back here once the model loads and its registry / patch tests pass.
    a `collate_multimodal_metadata` patchgen helper + a `get_metadata_collate_func`
    override, the per-modality `vit_metadata` sub-dict threaded through
    Model.forward → ViT.forward (with a runtime fallback), and the model added to
-   `_MM_METADATA_WIRED_CASES` in the sync gate test.
+   `_MM_METADATA_WIRED_CASES` in the sync gate test. If the model is a Qwen VL
+   sibling, `config.add_helper()` the shared
+   `veomni/models/transformers/qwen_vl_collate_utils.py` helpers instead of
+   writing local copies.
 
 ## Phase 5: Test and Document
 

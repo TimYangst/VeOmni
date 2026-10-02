@@ -1542,7 +1542,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1518,37 +2349,248 @@
+@@ -1518,37 +2349,250 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -1673,6 +1673,22 @@
 +                    "`pixel_values_merged` requires `image_grid_thw` and/or `video_grid_thw` to "
 +                    "split the merged feature stream back into its per-modality parts."
 +                )
++            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
++            # rows, so the image share of the merged stream is a pure host-side
++            # computation off the collator metadata — no host-device sync. Deriving
++            # the row count from the grid tensor here instead would sync on every
++            # step, so a caller wiring the merge hook must wire the metadata hook
++            # too rather than fall back. Resolved before the ViT call so that
++            # misconfiguration fails fast instead of paying a full vision forward
++            # and an all-gather first.
++            if "vit_merged_n_image_rows" not in multimodal_metadata:
++                raise ValueError(
++                    "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
++                    "to split the merged feature stream. Wire "
++                    "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
++                    "alongside the pre-slice merge hook."
++                )
++            n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
 +            merged_grid_thw = torch.cat(merged_grids, dim=0) if len(merged_grids) > 1 else merged_grids[0]
 +            merged_outputs: BaseModelOutputWithPooling = self.get_image_features(
 +                pixel_values_merged, merged_grid_thw, return_dict=True, **merged_vit_kwargs
@@ -1690,20 +1706,6 @@
 +                merged_embeds = gather_outputs(merged_embeds, gather_dim=0, group=get_parallel_state().sp_group)
 +            # --- Patch.1 ---
 +
-+            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
-+            # rows, so the image share of the merged stream is a pure host-side
-+            # computation off the collator metadata — no host-device sync. Deriving
-+            # the row count from the grid tensor here instead would sync on every
-+            # step, so a caller wiring the merge hook must wire the metadata hook
-+            # too rather than fall back.
-+            if "vit_merged_n_image_rows" not in multimodal_metadata:
-+                raise ValueError(
-+                    "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
-+                    "to split the merged feature stream. Wire "
-+                    "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
-+                    "alongside the pre-slice merge hook."
-+                )
-+            n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
 +            if image_grid_thw is not None:
 +                image_embeds = merged_embeds[:n_image_features]
 +            if video_grid_thw is not None:
@@ -1808,7 +1810,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1558,6 +2600,18 @@
+@@ -1558,6 +2602,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -1827,7 +1829,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1565,13 +2619,17 @@
+@@ -1565,13 +2621,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1849,7 +1851,7 @@
 
 
  @auto_docstring
-@@ -1603,10 +2661,13 @@
+@@ -1603,10 +2663,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -1863,7 +1865,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1635,21 +2696,50 @@
+@@ -1635,21 +2698,50 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -1918,7 +1920,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1672,15 +2762,60 @@
+@@ -1672,15 +2764,60 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1980,7 +1982,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2859,18 @@
+@@ -1724,48 +2861,18 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2039,7 +2041,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2881,86 @@
+@@ -1776,28 +2883,86 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2134,7 +2136,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3147,29 @@
+@@ -1984,6 +3149,29 @@
 
          return input_ids, model_kwargs
 

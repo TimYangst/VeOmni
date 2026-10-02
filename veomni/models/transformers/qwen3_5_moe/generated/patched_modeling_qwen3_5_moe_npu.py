@@ -2731,6 +2731,22 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                     "`pixel_values_merged` requires `image_grid_thw` and/or `video_grid_thw` to "
                     "split the merged feature stream back into its per-modality parts."
                 )
+            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
+            # rows, so the image share of the merged stream is a pure host-side
+            # computation off the collator metadata — no host-device sync. Deriving
+            # the row count from the grid tensor here instead would sync on every
+            # step, so a caller wiring the merge hook must wire the metadata hook
+            # too rather than fall back. Resolved before the ViT call so that
+            # misconfiguration fails fast instead of paying a full vision forward
+            # and an all-gather first.
+            if "vit_merged_n_image_rows" not in multimodal_metadata:
+                raise ValueError(
+                    "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
+                    "to split the merged feature stream. Wire "
+                    "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
+                    "alongside the pre-slice merge hook."
+                )
+            n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
             merged_grid_thw = torch.cat(merged_grids, dim=0) if len(merged_grids) > 1 else merged_grids[0]
             merged_outputs: BaseModelOutputWithPooling = self.get_image_features(
                 pixel_values_merged, merged_grid_thw, return_dict=True, **merged_vit_kwargs
@@ -2744,20 +2760,6 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                 merged_embeds = gather_outputs(merged_embeds, gather_dim=0, group=get_parallel_state().sp_group)
             # --- Patch.1 ---
 
-            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
-            # rows, so the image share of the merged stream is a pure host-side
-            # computation off the collator metadata — no host-device sync. Deriving
-            # the row count from the grid tensor here instead would sync on every
-            # step, so a caller wiring the merge hook must wire the metadata hook
-            # too rather than fall back.
-            if "vit_merged_n_image_rows" not in multimodal_metadata:
-                raise ValueError(
-                    "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
-                    "to split the merged feature stream. Wire "
-                    "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
-                    "alongside the pre-slice merge hook."
-                )
-            n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
             if image_grid_thw is not None:
                 image_embeds = merged_embeds[:n_image_features]
             if video_grid_thw is not None:

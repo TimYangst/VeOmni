@@ -99,7 +99,13 @@ generated file, and the TTS path is excluded anyway.
   1. Add a module-level `collate_multimodal_metadata(batch, sp_pad)` helper
      (`@config.add_helper`) — read `batch["image_grid_thw"]` / `["video_grid_thw"]`,
      `.tolist()`, derive `vit_*_cu_seqlens` / `vit_*_max_seqlen` (+ the `sp_pad`
-     tail entry), write `batch["multimodal_metadata"]`.
+     tail entry), write `batch["multimodal_metadata"]`. For a Qwen VL sibling,
+     register the shared helper instead:
+     `config.add_helper(collate_multimodal_metadata)` imported from
+     `veomni/models/transformers/qwen_vl_collate_utils.py` — a registered helper
+     is emitted verbatim whichever module defines it, so keep anything you add
+     there free of model-specific symbols (helpers bypass the per-patch
+     `name_map`).
   2. `@config.override_method("<M>ForConditionalGeneration.get_metadata_collate_func")`
      returning that helper (or a `partial` over it if the formula needs config).
   3. Optional `get_extra_collate_infos` `override_method` for audio / extra

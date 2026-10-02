@@ -172,3 +172,133 @@ def test_collator_merged_metadata_matches_no_metadata_path(case):
         out_metadata = model(merged_pixels, grid_thw=merged_grid, **merged_vit_kwargs)
 
     assert torch.equal(out_metadata.pooler_output, out_no_metadata.pooler_output)
+
+
+# ---------------------------------------------------------------------------
+# Topology gate: raw per-modality streams are only legal without SP and FSDP
+# ---------------------------------------------------------------------------
+
+
+class _ForceTopology:
+    """The real parallel state with only the two flags the vision gate reads
+    overridden, so the gate is exercised without standing up a process group.
+
+    Delegating (rather than a bare namespace) keeps every other attribute the
+    forward touches — ``async_enabled``, ``sp_group``, … — truthful.
+    """
+
+    def __init__(self, real, *, sp_enabled, fsdp_enabled):
+        self._real = real
+        self._sp = sp_enabled
+        self._fsdp = fsdp_enabled
+
+    @property
+    def sp_enabled(self):
+        return self._sp
+
+    @property
+    def fsdp_enabled(self):
+        return self._fsdp
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _build_full_qwen3_vl():
+    """A ~1.5M-param Qwen3-VL on CPU with eager attention.
+
+    Only qwen3_vl is built here: after the shared-helper refactor the Patch.7
+    gate is emitted from the same source in all four families (the configs are
+    identical in that region, and ``patchgen --check`` keeps the generated
+    copies in step), so one model covers the shared contract.
+    """
+    module = pytest.importorskip("veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu")
+    config = AutoConfig.from_pretrained(os.path.join(REPO_ROOT, "tests", "toy_config", "qwen3vl_toy"))
+    config.image_token_id, config.video_token_id = 2030, 2031
+    # Keep the toy head_dim: rope_parameters.mrope_section sums to head_dim/2.
+    for key, value in {
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "vocab_size": 2048,
+    }.items():
+        setattr(config.text_config, key, value)
+    for key, value in {**_SMALL_VIT, "depth": 2, "num_heads": 2, "deepstack_visual_indexes": [0, 1]}.items():
+        setattr(config.vision_config, key, value)
+    for sub in (config, config.text_config, config.vision_config):
+        sub._attn_implementation = "eager"  # no flash-attn on a CPU box
+    return module, module.Qwen3VLForConditionalGeneration(config).float().eval(), config
+
+
+def _raw_image_batch(config):
+    vc = config.vision_config
+    feat_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
+    h = w = vc.spatial_merge_size * 2
+    image_rows = h * w
+    n_tokens = image_rows // (vc.spatial_merge_size**2)
+    seq_len = 4 + n_tokens
+    image_mask = torch.zeros(1, seq_len, dtype=torch.bool)
+    image_mask[0, 2 : 2 + n_tokens] = True
+    return {
+        "input_ids": torch.zeros(1, seq_len, dtype=torch.long),
+        "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
+        "pixel_values": torch.randn(image_rows, feat_dim, generator=torch.Generator().manual_seed(3)),
+        "image_grid_thw": torch.tensor([[1, h, w]], dtype=torch.long),
+        "image_mask": image_mask,
+        "video_mask": torch.zeros(1, seq_len, dtype=torch.bool),
+    }
+
+
+@pytest.mark.parametrize(
+    "sp_enabled, fsdp_enabled, expect_raise",
+    [
+        # SP: rank-local slices of two streams cannot be reordered afterwards,
+        # so raw streams would be silently wrong.
+        pytest.param(True, False, True, id="sp-only"),
+        # FSDP: one call per present modality makes the vision-tower call count
+        # data-dependent, desyncing the collectives.
+        pytest.param(False, True, True, id="fsdp-only"),
+        # Neither: inference / single device, where raw streams are fine.
+        pytest.param(False, False, False, id="neither"),
+    ],
+)
+def test_raw_streams_rejected_under_sp_or_fsdp(monkeypatch, sp_enabled, fsdp_enabled, expect_raise):
+    module, model, config = _build_full_qwen3_vl()
+    batch = _raw_image_batch(config)
+
+    real = module.get_parallel_state
+    monkeypatch.setattr(
+        module,
+        "get_parallel_state",
+        lambda: _ForceTopology(real(), sp_enabled=sp_enabled, fsdp_enabled=fsdp_enabled),
+    )
+
+    if expect_raise:
+        with pytest.raises(ValueError, match="pixel_values_merged"):
+            with torch.no_grad():
+                model.model(**batch)
+    else:
+        with torch.no_grad():
+            out = model.model(**batch)
+        assert out.last_hidden_state.shape[:2] == (1, batch["input_ids"].shape[-1])
+
+
+def test_merged_stream_accepted_under_fsdp(monkeypatch):
+    """The counterpart of the gate above: the collator-produced layout is what
+    the forward wants once FSDP is on."""
+    module, model, config = _build_full_qwen3_vl()
+    batch = _raw_image_batch(config)
+
+    # Exactly what the collator does, in pipeline order.
+    module.merge_pixel_streams(batch)
+    module.collate_multimodal_metadata(batch, {})
+    assert "pixel_values_merged" in batch
+
+    real = module.get_parallel_state
+    monkeypatch.setattr(
+        module, "get_parallel_state", lambda: _ForceTopology(real(), sp_enabled=False, fsdp_enabled=True)
+    )
+    with torch.no_grad():
+        out = model.model(**batch)
+    assert out.last_hidden_state.shape[:2] == (1, batch["input_ids"].shape[-1])
