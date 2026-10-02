@@ -465,13 +465,18 @@ def qwen3_5_moe_model_forward_patched(
 
         # The ViT merger emits one feature row per `spatial_merge_unit` pixel
         # rows, so the image share of the merged stream is a pure host-side
-        # computation. The collator metadata carries the global image patch-row
-        # count; the fallback syncs once on the tiny grid tensor for callers
-        # that bypass the metadata hook.
-        n_image_rows = multimodal_metadata.get("vit_merged_n_image_rows")
-        if n_image_rows is None:
-            n_image_rows = 0 if image_grid_thw is None else int(image_grid_thw.prod(dim=-1).sum())
-        n_image_features = n_image_rows // self.visual.spatial_merge_unit
+        # computation off the collator metadata — no host-device sync. Deriving
+        # the row count from the grid tensor here instead would sync on every
+        # step, so a caller wiring the merge hook must wire the metadata hook
+        # too rather than fall back.
+        if "vit_merged_n_image_rows" not in multimodal_metadata:
+            raise ValueError(
+                "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
+                "to split the merged feature stream. Wire "
+                "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
+                "alongside the pre-slice merge hook."
+            )
+        n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
         if image_grid_thw is not None:
             image_embeds = merged_embeds[:n_image_features]
         if video_grid_thw is not None:

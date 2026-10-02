@@ -1294,7 +1294,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1157,48 +1870,274 @@
+@@ -1157,48 +1870,279 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1449,13 +1449,18 @@
 +
 +            # The ViT merger emits one feature row per `spatial_merge_unit` pixel
 +            # rows, so the image share of the merged streams is a pure host-side
-+            # computation. The collator metadata carries the global image patch-row
-+            # count; the fallback syncs once on the tiny grid tensor for callers
-+            # that bypass the metadata hook.
-+            n_image_rows = multimodal_metadata.get("vit_merged_n_image_rows")
-+            if n_image_rows is None:
-+                n_image_rows = 0 if image_grid_thw is None else int(image_grid_thw.prod(dim=-1).sum())
-+            n_image_features = n_image_rows // self.visual.spatial_merge_unit
++            # computation off the collator metadata — no host-device sync. Deriving
++            # the row count from the grid tensor here instead would sync on every
++            # step, so a caller wiring the merge hook must wire the metadata hook
++            # too rather than fall back.
++            if "vit_merged_n_image_rows" not in multimodal_metadata:
++                raise ValueError(
++                    "`pixel_values_merged` needs `multimodal_metadata['vit_merged_n_image_rows']` "
++                    "to split the merged feature stream. Wire "
++                    "`MainCollator(metadata_collate_func=model.get_metadata_collate_func())` "
++                    "alongside the pre-slice merge hook."
++                )
++            n_image_features = multimodal_metadata["vit_merged_n_image_rows"] // self.visual.spatial_merge_unit
 +            if image_grid_thw is not None:
 +                image_embeds = merged_embeds[:n_image_features]
 +                deepstack_image_embeds = [embed[:n_image_features] for embed in merged_deepstack]
@@ -1596,7 +1601,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1208,25 +2147,71 @@
+@@ -1208,25 +2152,71 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1673,7 +1678,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1234,13 +2219,17 @@
+@@ -1234,13 +2224,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1692,7 +1697,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1255,6 +2244,12 @@
+@@ -1255,6 +2249,12 @@
      """
 
      rope_deltas: torch.LongTensor | None = None
@@ -1705,7 +1710,7 @@
 
 
  class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
-@@ -1295,6 +2290,16 @@
+@@ -1295,6 +2295,16 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1722,7 +1727,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1309,48 +2314,15 @@
+@@ -1309,48 +2319,15 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1776,7 +1781,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1361,27 +2333,55 @@
+@@ -1361,27 +2338,55 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1840,7 +1845,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1569,6 +2569,58 @@
+@@ -1569,6 +2574,58 @@
 
          return input_ids, model_kwargs
 
