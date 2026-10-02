@@ -53,7 +53,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     apply_rotary_pos_emb_vision_patched,
     qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
-    qwen3_vl_get_pre_sp_collate_func_patched,
+    qwen3_vl_get_pre_slice_collate_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
@@ -242,10 +242,10 @@ config.override_method(
     description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 config.override_method(
-    "Qwen3VLMoeForConditionalGeneration.get_pre_sp_collate_func",
-    replacement=qwen3_vl_get_pre_sp_collate_func_patched,
+    "Qwen3VLMoeForConditionalGeneration.get_pre_slice_collate_func",
+    replacement=qwen3_vl_get_pre_slice_collate_func_patched,
     name_map=_NAME_MAP,
-    description="Expose the pre-SP pixel-stream merge hook to the VeOmni collator",
+    description="Expose the pre-slice pixel-stream merge hook to the VeOmni collator",
 )
 config.replace_function(
     "apply_rotary_pos_emb",
@@ -413,9 +413,9 @@ def qwen3_vl_moe_model_forward_patched(
             "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
         }
     }
-    # Metadata for the collator-merged image+video stream (SP path, see
-    # Patch.7 below); emitted by `collate_multimodal_metadata` when the
-    # pre-SP hook replaced the raw pixel streams with `pixel_values_merged`.
+    # Metadata for the collator-merged image+video stream (see Patch.7
+    # below); emitted by `collate_multimodal_metadata` when the pre-slice hook
+    # replaced the raw pixel streams with `pixel_values_merged`.
     merged_vit_kwargs = {
         "vit_metadata": {
             "grid_thw_list": multimodal_metadata.get("merged_grid_thw_list"),
@@ -432,105 +432,105 @@ def qwen3_vl_moe_model_forward_patched(
     # per step, or the param all-gather / grad reduce-scatter collectives
     # desync across ranks with different modality mixes. Every rank therefore
     # runs the tower exactly ONCE per step: one merged image+video call, one
-    # single-modality call, or one dummy (Patch.4 below). ViT attention is
-    # segmented per frame via cu_seqlens, so running a cat of the two pixel
-    # streams through one call is numerically identical to two calls; the
-    # deepstack mergers emit one row per merged token, so the per-layer
+    # single-modality call, or one dummy (Patch.4 below).
+    #
+    # The merge happens in the collator, not here: the model exposes
+    # `get_pre_slice_collate_func` (-> `merge_pixel_streams`) and the collator
+    # ships a single `pixel_values_merged` stream (global row order: image
+    # rows, then video rows, then one sp-pad tail under SP). That placement is
+    # forced by SP — rank-local slices of two independently-sliced streams
+    # cannot be concatenated afterwards without misordering the global vision
+    # sequence — and is reused with SP off so there is exactly one merged code
+    # path here. ViT attention is segmented per frame via cu_seqlens, so one
+    # call over the concatenated streams is numerically identical to two calls;
+    # the deepstack mergers emit one row per merged token, so the per-layer
     # deepstack streams split at the same row count.
-    #   * SP disabled: mixed batches are merged in-forward by cat-ing the two
-    #     raw pixel streams.
-    #   * SP enabled: the VeOmni collator merges the streams BEFORE its
-    #     per-key SP pad/slice via the model's `get_pre_sp_collate_func` hook
-    #     (`merge_pixel_streams_pre_sp`) and ships `pixel_values_merged`
-    #     (global row order: image rows, video rows, one sp-pad tail) instead
-    #     of the raw per-modality streams. Raw streams are rejected under SP:
-    #     they are SP-sliced per rank independently, so cat-ing the rank-local
-    #     slices here would feed the vision tower's sequence exchange in the
-    #     wrong global order.
+    #
+    # Raw per-modality streams are accepted only when neither SP nor FSDP is
+    # on (inference, single device), where serving each present modality with
+    # its own call is free and correct. Under SP or FSDP they are rejected —
+    # see the raise below for why each case is fatal.
     pixel_values_merged = kwargs.pop("pixel_values_merged", None)
     image_embeds = None
     video_embeds = None
-    if get_parallel_state().sp_enabled:
+    if pixel_values_merged is not None:
         if pixel_values is not None or pixel_values_videos is not None:
             raise ValueError(
-                "Sequence parallel requires the collator-merged vision stream: got raw "
-                "`pixel_values`/`pixel_values_videos` instead of `pixel_values_merged`. "
-                "Wire `MainCollator(pre_sp_collate_func=model.get_pre_sp_collate_func())` "
-                "(VeOmni's VLM trainer does this automatically)."
+                "Got `pixel_values_merged` together with a raw `pixel_values` / "
+                "`pixel_values_videos` stream. The pre-slice collate hook replaces the raw "
+                "streams; passing both would feed the vision tower twice."
             )
-        if pixel_values_merged is not None:
-            merged_grids = [grid for grid in (image_grid_thw, video_grid_thw) if grid is not None]
-            merged_grid_thw = torch.cat(merged_grids, dim=0) if len(merged_grids) > 1 else merged_grids[0]
-            merged_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-                pixel_values_merged, merged_grid_thw, return_dict=True, **merged_vit_kwargs
+        merged_grids = [grid for grid in (image_grid_thw, video_grid_thw) if grid is not None]
+        if not merged_grids:
+            raise ValueError(
+                "`pixel_values_merged` requires `image_grid_thw` and/or `video_grid_thw` to "
+                "split the merged feature stream back into its per-modality parts."
             )
-            # One gather per stream reconstitutes the full merged feature
-            # streams in global row order: (rows // sp_size, h) -> (rows, h).
-            merged_embeds = gather_outputs(
-                merged_outputs.pooler_output, gather_dim=0, group=get_parallel_state().sp_group
-            )
-            merged_deepstack = [
-                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group)
-                for embed in merged_outputs.deepstack_features
-            ]
-            # The ViT merger emits one feature row per `spatial_merge_unit`
-            # pixel rows, so the image share of the merged streams is a pure
-            # host-side computation. The collator metadata carries the global
-            # image patch-row count; the fallback syncs once on the tiny grid
-            # tensor for callers that bypass the metadata hook.
-            n_image_rows = multimodal_metadata.get("vit_merged_n_image_rows")
-            if n_image_rows is None:
-                n_image_rows = 0 if image_grid_thw is None else int(image_grid_thw.prod(dim=-1).sum())
-            n_image_features = n_image_rows // self.visual.spatial_merge_unit
-            if image_grid_thw is not None:
-                image_embeds = merged_embeds[:n_image_features]
-                deepstack_image_embeds = [embed[:n_image_features] for embed in merged_deepstack]
-            if video_grid_thw is not None:
-                # Trailing sp-pad feature rows stay unused: masked_scatter
-                # consumes leading rows only, and the per-rank deepstack
-                # slice below indexes within the valid placeholder range.
-                video_embeds = merged_embeds[n_image_features:]
-                deepstack_video_embeds = [embed[n_image_features:] for embed in merged_deepstack]
-    elif pixel_values_merged is not None:
-        raise ValueError(
-            "`pixel_values_merged` is only produced by the pre-SP collate hook and is only "
-            "consumed under sequence parallel; got it with SP disabled. Pass raw "
-            "`pixel_values` / `pixel_values_videos` instead."
-        )
-    elif pixel_values is not None and pixel_values_videos is not None:
-        merged_pixel_values = torch.cat(
-            [pixel_values.type(self.visual.dtype), pixel_values_videos.type(self.visual.dtype)], dim=0
-        )
-        merged_grid_thw = torch.cat([image_grid_thw, video_grid_thw], dim=0)
+        merged_grid_thw = torch.cat(merged_grids, dim=0) if len(merged_grids) > 1 else merged_grids[0]
         merged_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            merged_pixel_values,
-            merged_grid_thw,
-            return_dict=True,
-            **merge_image_video_vit_kwargs(image_vit_kwargs, video_vit_kwargs),  # noqa: F821 defined via add_helper
+            pixel_values_merged, merged_grid_thw, return_dict=True, **merged_vit_kwargs
         )
-        # The ViT merger emits one feature row per `spatial_merge_unit` pixel
-        # rows, so the image share of the merged streams is a pure shape
-        # computation — no host-device sync.
-        n_image_features = pixel_values.shape[0] // self.visual.spatial_merge_unit
-        image_embeds = merged_outputs.pooler_output[:n_image_features]
-        video_embeds = merged_outputs.pooler_output[n_image_features:]
-        deepstack_image_embeds = [embed[:n_image_features] for embed in merged_outputs.deepstack_features]
-        deepstack_video_embeds = [embed[n_image_features:] for embed in merged_outputs.deepstack_features]
+        merged_embeds = merged_outputs.pooler_output
+        merged_deepstack = list(merged_outputs.deepstack_features)
 
-    # Single-modality calls (SP disabled only: under SP everything arrives via
-    # the merged stream above).
-    if pixel_values is not None and image_embeds is None:
-        image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+        # --- Patch.1 ---
+        # One gather per stream reconstitutes the full merged feature streams
+        # in global row order: (rows // sp_size, h) -> (rows, h).
+        if get_parallel_state().sp_enabled:
+            merged_embeds = gather_outputs(merged_embeds, gather_dim=0, group=get_parallel_state().sp_group)
+            merged_deepstack = [
+                gather_outputs(embed, gather_dim=0, group=get_parallel_state().sp_group) for embed in merged_deepstack
+            ]
+        # --- Patch.1 ---
+
+        # The ViT merger emits one feature row per `spatial_merge_unit` pixel
+        # rows, so the image share of the merged streams is a pure host-side
+        # computation. The collator metadata carries the global image patch-row
+        # count; the fallback syncs once on the tiny grid tensor for callers
+        # that bypass the metadata hook.
+        n_image_rows = multimodal_metadata.get("vit_merged_n_image_rows")
+        if n_image_rows is None:
+            n_image_rows = 0 if image_grid_thw is None else int(image_grid_thw.prod(dim=-1).sum())
+        n_image_features = n_image_rows // self.visual.spatial_merge_unit
+        if image_grid_thw is not None:
+            image_embeds = merged_embeds[:n_image_features]
+            deepstack_image_embeds = [embed[:n_image_features] for embed in merged_deepstack]
+        if video_grid_thw is not None:
+            # Trailing sp-pad feature rows stay unused: masked_scatter consumes
+            # leading rows only, and the per-rank deepstack slice below indexes
+            # within the valid placeholder range.
+            video_embeds = merged_embeds[n_image_features:]
+            deepstack_video_embeds = [embed[n_image_features:] for embed in merged_deepstack]
+    elif (get_parallel_state().sp_enabled or get_parallel_state().fsdp_enabled) and (
+        pixel_values is not None or pixel_values_videos is not None
+    ):
+        # Two independent reasons, both fatal:
+        #   * SP: the collator slices each pixel stream per rank on its own, so
+        #     the rank-local streams cannot be concatenated back into the
+        #     global row order the vision sequence exchange assumes — results
+        #     would be silently wrong, not just slow.
+        #   * FSDP: serving each modality with its own call makes the number of
+        #     vision-tower executions data-dependent, desyncing the param
+        #     all-gather / grad reduce-scatter across ranks.
+        raise ValueError(
+            "Sequence parallel / FSDP training requires the collator-merged vision stream: got "
+            "raw `pixel_values` / `pixel_values_videos` instead of `pixel_values_merged`. Wire "
+            "`MainCollator(pre_slice_collate_func=model.get_pre_slice_collate_func())` "
+            "(VeOmni's VLM trainer does this automatically)."
         )
-        image_embeds = image_outputs.pooler_output
-        deepstack_image_embeds = image_outputs.deepstack_features
-    if pixel_values_videos is not None and video_embeds is None:
-        video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
-        )
-        video_embeds = video_outputs.pooler_output
-        deepstack_video_embeds = video_outputs.deepstack_features
+    else:
+        if pixel_values is not None:
+            image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
+            )
+            image_embeds = image_outputs.pooler_output
+            deepstack_image_embeds = image_outputs.deepstack_features
+        if pixel_values_videos is not None:
+            video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
+            )
+            video_embeds = video_outputs.pooler_output
+            deepstack_video_embeds = video_outputs.deepstack_features
     # --- Patch.7 ---
 
     if image_embeds is not None:

@@ -68,15 +68,14 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     compute_mtp_loss,
     compute_mtp_router_aux_loss,
     get_position_id,
-    merge_image_video_vit_kwargs,
-    merge_pixel_streams_pre_sp,
+    merge_pixel_streams,
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
     qwen3_5_moe_forconditional_generation_get_metadata_collate_func,
     qwen3_5_moe_forconditional_generation_get_position_id_func,
-    qwen3_5_moe_forconditional_generation_get_pre_sp_collate_func,
+    qwen3_5_moe_forconditional_generation_get_pre_slice_collate_func,
     qwen3_5_moe_forconditional_generation_init_patched,
     qwen3_5_moe_get_parallel_plan_patched,
     qwen3_5_moe_model_forward_patched,
@@ -170,8 +169,7 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 config.add_helper(mm_token_type_ids_from_input_ids)
 config.add_helper(get_position_id)
 config.add_helper(collate_multimodal_metadata)
-config.add_helper(merge_image_video_vit_kwargs)
-config.add_helper(merge_pixel_streams_pre_sp)
+config.add_helper(merge_pixel_streams)
 config.add_helper(_Qwen3_5MoeFakeForPosID)
 
 
@@ -292,9 +290,9 @@ config.override_method(
 
 
 config.override_method(
-    "Qwen3_5MoeForConditionalGeneration.get_pre_sp_collate_func",
-    replacement=qwen3_5_moe_forconditional_generation_get_pre_sp_collate_func,
-    description="Expose the pre-SP pixel-stream merge hook to the VeOmni collator",
+    "Qwen3_5MoeForConditionalGeneration.get_pre_slice_collate_func",
+    replacement=qwen3_5_moe_forconditional_generation_get_pre_slice_collate_func,
+    description="Expose the pre-slice pixel-stream merge hook to the VeOmni collator",
 )
 
 

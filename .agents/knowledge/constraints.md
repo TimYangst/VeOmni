@@ -155,15 +155,21 @@ Core files:
     - Audio: `librosa` at configurable `sample_rate` (default 16kHz).
     - Placeholder IDs: `veomni/utils/constants.py` defines the negative placeholders (`IMAGE_INPUT_INDEX = -200`, `VIDEO_INPUT_INDEX = -300`, `AUDIO_INPUT_INDEX = -400`; `TYPE2INDEX` groups them by input/output). `MultimodalChatTemplate` writes them into `input_ids`, and `process_sample_qwen_vl()` derives `image_mask` / `video_mask` from them, then zeroes the placeholders before text embedding. `process_sample_qwen_omni()` instead derives `image_mask` / `video_mask` / `audio_mask` from the model's own multimodal token ids. The mask keys are `{modality}_mask` — the V1 `{modality}_{input|output}_mask` convention went away with the SeedOmni V1 stack.
 
-16. **Qwen VL family under SP requires the collator-merged vision stream**
-    - With sequence parallel enabled, qwen3_5 / qwen3_5_moe / qwen3_vl /
-      qwen3_vl_moe forwards accept only `pixel_values_merged` (produced by the
-      model's `get_pre_sp_collate_func` hook inside `SequenceParallelCollator`,
-      BEFORE the per-key SP pad/slice) and raise on raw `pixel_values` /
-      `pixel_values_videos`; with SP disabled the reverse holds. Merging after
-      the per-key slice is unfixable: rank-local slices of two
-      independently-sliced streams cannot be concatenated without misordering
-      the global vision sequence.
+16. **Qwen VL family under SP or FSDP requires the collator-merged vision stream**
+    - qwen3_5 / qwen3_5_moe / qwen3_vl / qwen3_vl_moe forwards accept only
+      `pixel_values_merged` once SP or FSDP is on, and raise on raw
+      `pixel_values` / `pixel_values_videos`. It is produced by the model's
+      `get_pre_slice_collate_func` hook, which the collator runs on the packed
+      global batch — inside `SequenceParallelCollator` before the per-key SP
+      pad/slice, or inside `PackingCollator` when SP is off.
+    - The hook runs in both modes on purpose, so the forward has one merged
+      code path. Merging *after* the per-key SP slice is unfixable: rank-local
+      slices of two independently-sliced streams cannot be concatenated
+      without misordering the global vision sequence.
+    - Raw streams stay legal without SP and FSDP (inference, single device).
+      The two rejections have different causes: under SP raw streams are
+      silently wrong, under FSDP they make the vision-tower call count
+      data-dependent and desync the collectives.
     - This keeps the vision tower at exactly ONE execution per rank per step
       (merged / single-modality / dummy), which FSDP collective alignment
       depends on. See `.agents/knowledge/multimodal_metadata.md`.

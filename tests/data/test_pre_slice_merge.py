@@ -1,16 +1,19 @@
-"""Pre-SP pixel-stream merge through MainCollator (exactly-once ViT under SP).
+"""Pre-slice pixel-stream merge through MainCollator (exactly-once ViT).
 
-Drives the real model hooks (``merge_pixel_streams_pre_sp`` +
+Drives the real model hooks (``merge_pixel_streams`` +
 ``collate_multimodal_metadata`` from the qwen3_vl generated modeling) through
-``MainCollator`` with a monkeypatched sp_size=2 parallel state, and asserts:
+``MainCollator`` and asserts:
 
-1. the raw ``pixel_values`` / ``pixel_values_videos`` are replaced by one
-   ``pixel_values_merged`` stream (image rows first), SP-padded once and
-   sliced per rank;
+1. with SP enabled (monkeypatched sp_size=2), the raw ``pixel_values`` /
+   ``pixel_values_videos`` are replaced by one ``pixel_values_merged`` stream
+   (image rows first), SP-padded once and sliced per rank;
 2. the two rank slices reassemble exactly to ``cat(image, video, pad)``;
 3. ``multimodal_metadata`` carries the merged cu_seqlens (image frames, then
    video frames, then one sp-pad tail), max_seqlen, and the global image
-   patch-row count used by Model.forward to split the gathered features.
+   patch-row count used by Model.forward to split the gathered features;
+4. with SP disabled the hook still runs — ``PackingCollator`` is then the last
+   pipeline stage — so the model sees the same merged layout, just with no
+   sp-pad tail and no per-rank slice.
 
 CPU-only; mirrors the monkeypatch pattern of ``test_collators.py`` and the
 hook-protocol coverage of ``test_mm_metadata.py``.
@@ -36,7 +39,7 @@ def _fake_ps(sp_enabled: bool, sp_size: int = 1, sp_rank: int = 0):
 @pytest.fixture(scope="module")
 def hooks():
     module = pytest.importorskip("veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu")
-    return module.merge_pixel_streams_pre_sp, module.collate_multimodal_metadata
+    return module.merge_pixel_streams, module.collate_multimodal_metadata
 
 
 def _mixed_feature(feat_dim: int = 8):
@@ -56,10 +59,10 @@ def _mixed_feature(feat_dim: int = 8):
     }
 
 
-def test_pre_sp_merge_slices_one_stream(monkeypatch, hooks):
+def test_pre_slice_merge_slices_one_stream(monkeypatch, hooks):
     import veomni.data.data_collator as m
 
-    pre_sp_hook, metadata_hook = hooks
+    pre_slice_hook, metadata_hook = hooks
     sp_size = 2
     feature = _mixed_feature()
     expected_merged = torch.cat([feature["pixel_values"], feature["pixel_values_videos"]], dim=0)
@@ -69,7 +72,7 @@ def test_pre_sp_merge_slices_one_stream(monkeypatch, hooks):
         monkeypatch.setattr(m, "get_parallel_state", lambda r=sp_rank: _fake_ps(True, sp_size, r))
         collator = m.MainCollator(
             metadata_collate_func=metadata_hook,
-            pre_sp_collate_func=pre_sp_hook,
+            pre_slice_collate_func=pre_slice_hook,
         )
         out = collator([{k: v.clone() for k, v in feature.items()}])
 
@@ -89,7 +92,7 @@ def test_pre_sp_merge_slices_one_stream(monkeypatch, hooks):
         assert "vit_image_cu_seqlens" not in md
         assert "vit_video_cu_seqlens" not in md
         # The hook chain must stay picklable for spawned DataLoader workers.
-        pickle.dumps((pre_sp_hook, metadata_hook))
+        pickle.dumps((pre_slice_hook, metadata_hook))
 
     # 16 padded rows split evenly across the two ranks...
     assert all(s.shape[0] == 8 for s in rank_slices)
@@ -99,12 +102,12 @@ def test_pre_sp_merge_slices_one_stream(monkeypatch, hooks):
     assert torch.equal(reassembled[12:], torch.zeros(4, expected_merged.shape[1]))
 
 
-def test_pre_sp_merge_single_modality_and_text_only(monkeypatch, hooks):
+def test_pre_slice_merge_single_modality_and_text_only(monkeypatch, hooks):
     import veomni.data.data_collator as m
 
-    pre_sp_hook, metadata_hook = hooks
+    pre_slice_hook, metadata_hook = hooks
     monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(True, 2, 0))
-    collator = m.MainCollator(metadata_collate_func=metadata_hook, pre_sp_collate_func=pre_sp_hook)
+    collator = m.MainCollator(metadata_collate_func=metadata_hook, pre_slice_collate_func=pre_slice_hook)
 
     # Image-only: the merged stream is just the image stream.
     feature = _mixed_feature()
@@ -125,3 +128,47 @@ def test_pre_sp_merge_single_modality_and_text_only(monkeypatch, hooks):
     out = collator([feature])
     assert "pixel_values_merged" not in out
     assert "multimodal_metadata" not in out
+
+
+def test_pre_slice_merge_runs_with_sp_disabled(monkeypatch, hooks):
+    """SP off: ``PackingCollator`` is the last stage and owns the hook call, so
+    the model still receives one merged stream — no sp-pad tail, no slice."""
+    import veomni.data.data_collator as m
+
+    pre_slice_hook, metadata_hook = hooks
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(False))
+    collator = m.MainCollator(metadata_collate_func=metadata_hook, pre_slice_collate_func=pre_slice_hook)
+
+    feature = _mixed_feature()
+    expected_merged = torch.cat([feature["pixel_values"], feature["pixel_values_videos"]], dim=0)
+    out = collator([{k: v.clone() for k, v in feature.items()}])
+
+    assert "pixel_values" not in out and "pixel_values_videos" not in out
+    # Whole merged stream, unpadded and unsliced.
+    assert torch.equal(out["pixel_values_merged"], expected_merged)
+
+    md = out["multimodal_metadata"]
+    assert md["merged_grid_thw_list"] == [[1, 2, 2], [2, 2, 2]]
+    # image frame (4 rows) + two video frames (4 rows each); no pad tail.
+    assert md["vit_merged_cu_seqlens"].tolist() == [0, 4, 8, 12]
+    assert md["vit_merged_max_seqlen"] == 4
+    assert md["vit_merged_n_image_rows"] == 4
+    assert "vit_image_cu_seqlens" not in md and "vit_video_cu_seqlens" not in md
+
+
+def test_models_without_the_hook_keep_raw_streams(monkeypatch, hooks):
+    """A collator built without the hook (text pipelines, external callers)
+    must leave the raw per-modality streams untouched."""
+    import veomni.data.data_collator as m
+
+    _, metadata_hook = hooks
+    monkeypatch.setattr(m, "get_parallel_state", lambda: _fake_ps(False))
+    collator = m.MainCollator(metadata_collate_func=metadata_hook)
+
+    out = collator([_mixed_feature()])
+    assert "pixel_values_merged" not in out
+    assert "pixel_values" in out and "pixel_values_videos" in out
+    # Per-modality metadata, as before the merge existed.
+    md = out["multimodal_metadata"]
+    assert md["vit_image_cu_seqlens"].tolist() == [0, 4]
+    assert md["vit_video_cu_seqlens"].tolist() == [0, 4, 8]

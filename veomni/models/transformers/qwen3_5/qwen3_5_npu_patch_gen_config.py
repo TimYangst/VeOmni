@@ -46,14 +46,13 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     collate_multimodal_metadata,
     compute_mtp_loss,
     get_position_id,
-    merge_image_video_vit_kwargs,
-    merge_pixel_streams_pre_sp,
+    merge_pixel_streams,
     mm_token_type_ids_from_input_ids,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
     qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
-    qwen3_5_forconditional_generation_get_pre_sp_collate_func,
+    qwen3_5_forconditional_generation_get_pre_slice_collate_func,
     qwen3_5_forconditional_generation_init_patched,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
@@ -172,8 +171,7 @@ config.add_post_import_block("_VEOMNI_VISION_ATTENTION_PATCHED = False")
 config.add_helper(mm_token_type_ids_from_input_ids)
 config.add_helper(get_position_id)
 config.add_helper(collate_multimodal_metadata)
-config.add_helper(merge_image_video_vit_kwargs)
-config.add_helper(merge_pixel_streams_pre_sp)
+config.add_helper(merge_pixel_streams)
 config.add_helper(_Qwen3_5FakeForPosID)
 
 # MTP helpers shared with the GPU patch.
@@ -877,9 +875,9 @@ config.override_method(
 
 
 config.override_method(
-    "Qwen3_5ForConditionalGeneration.get_pre_sp_collate_func",
-    replacement=qwen3_5_forconditional_generation_get_pre_sp_collate_func,
-    description="Expose the pre-SP pixel-stream merge hook to the VeOmni collator",
+    "Qwen3_5ForConditionalGeneration.get_pre_slice_collate_func",
+    replacement=qwen3_5_forconditional_generation_get_pre_slice_collate_func,
+    description="Expose the pre-slice pixel-stream merge hook to the VeOmni collator",
 )
 
 

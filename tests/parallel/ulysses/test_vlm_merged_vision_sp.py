@@ -14,9 +14,9 @@
 """SP=2 equivalence for the collator-merged (exactly-once) VLM vision forward.
 
 Each worker first computes a non-SP reference forward (default single-process
-parallel state, in-forward image+video merge), then initializes
+parallel state, same collator-merged stream), then initializes
 ``init_parallel_state(ulysses_size=2)`` and runs the full VeOmni SP pipeline:
-``MainCollator`` with the model's ``get_pre_sp_collate_func`` /
+``MainCollator`` with the model's ``get_pre_slice_collate_func`` /
 ``get_metadata_collate_func`` hooks -> ``pixel_values_merged`` -> patched
 ``Qwen3VLModel.forward``. Asserts:
 
@@ -168,6 +168,7 @@ def _run_worker(rank, world_size, init_file):
 
     ref_collator = MainCollator(
         metadata_collate_func=model.get_metadata_collate_func(),
+        pre_slice_collate_func=model.get_pre_slice_collate_func(),
     )
     ref_batch = ref_collator([{k: v.clone() for k, v in f.items()} for f in features])
     ref_len = ref_batch["input_ids"].shape[-1]
@@ -186,7 +187,7 @@ def _run_worker(rank, world_size, init_file):
         init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=get_device_type())
         sp_collator = MainCollator(
             metadata_collate_func=model.get_metadata_collate_func(),
-            pre_sp_collate_func=model.get_pre_sp_collate_func(),
+            pre_slice_collate_func=model.get_pre_slice_collate_func(),
         )
         sp_batch = sp_collator([{k: v.clone() for k, v in f.items()} for f in features])
         assert "pixel_values_merged" in sp_batch and "pixel_values" not in sp_batch

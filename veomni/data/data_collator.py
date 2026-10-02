@@ -41,16 +41,22 @@ from ..utils.seqlen_pos_transform_utils import (
 # ``batch`` in place, writing ``batch["multimodal_metadata"]``.
 MetadataCollateFunc = Callable[[Dict[str, Any], Dict[str, int]], None]
 
-# A model-provided hook that runs inside ``SequenceParallelCollator`` BEFORE
-# SP padding/slicing (same picklability contract as ``MetadataCollateFunc``).
+# A model-provided hook that runs on the packed, still-global batch, before
+# any per-key SP padding/slicing and before ``MetadataCollateFunc`` (same
+# picklability contract). It may restructure keys.
+#
 # Qwen VL-family models use it to merge ``pixel_values`` and
 # ``pixel_values_videos`` into one ``pixel_values_merged`` stream so the
-# vision tower runs exactly once per rank under SP: merging must happen
-# before the per-key SP slice, because rank-local slices of two
+# vision tower runs exactly once per rank per step. Under SP the merge *must*
+# happen here rather than in the model forward: rank-local slices of two
 # independently-sliced streams cannot be concatenated afterwards without
-# misordering the global vision sequence.
+# misordering the global vision sequence. It runs with SP disabled too — there
+# is no slice to precede, but merging in the dataloader worker keeps the batch
+# layout handed to the model identical in both modes (and moves the
+# concatenation off the device).
+#
 # Signature: ``fn(batch: dict) -> None`` — mutates ``batch`` in place.
-PreSPCollateFunc = Callable[[Dict[str, Any]], None]
+PreSliceCollateFunc = Callable[[Dict[str, Any]], None]
 
 
 logger = logging.get_logger(__name__)
@@ -154,8 +160,9 @@ DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "position_ids": DataCollateInfo(-1, False, 0, 1),
     "pixel_values": DataCollateInfo(0, True, 0, 4),
     "pixel_values_videos": DataCollateInfo(0, True, 0, 4),
-    # Single image+video stream produced by a model's pre-SP collate hook
-    # (see ``PreSPCollateFunc``); only present under SP for models that merge.
+    # Single image+video stream produced by a model's pre-slice collate hook
+    # (see ``PreSliceCollateFunc``); present with SP on or off for models that
+    # merge, and absent for models that do not.
     "pixel_values_merged": DataCollateInfo(0, True, 0, 4),
     "image_mask": DataCollateInfo(-1, False, 0, 1),
     "video_mask": DataCollateInfo(-1, False, 0, 1),
@@ -240,6 +247,11 @@ class PackingCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
+    # Model-provided hook (see ``PreSliceCollateFunc``). Invoked here only when
+    # SP is disabled — this collator is then the last pipeline stage. Under SP
+    # ``SequenceParallelCollator`` owns the call so the hook still runs exactly
+    # once, before the per-key slice.
+    pre_slice_collate_func: Optional[PreSliceCollateFunc] = None
 
     def __post_init__(self):
         self.sp_enabled = get_parallel_state().sp_enabled
@@ -315,14 +327,25 @@ class PackingCollator(DataCollator):
             linear_attn_tail_padding_length = max(0, batch["input_ids"].shape[-1] - input_ids_len_before)
 
         if not self.sp_enabled:
+            # Pre-slice hook first: it may replace the per-modality pixel keys
+            # with a merged stream, and ``metadata_collate_func`` below keys off
+            # the result. There is no slice to precede here, but running it in
+            # both modes is what keeps the batch layout the model sees
+            # identical with SP on and off. Under SP this call (and the
+            # metadata one) belong to ``SequenceParallelCollator`` instead, so
+            # the hook runs exactly once either way.
+            if self.pre_slice_collate_func is not None:
+                self.pre_slice_collate_func(batch)
+
             add_flash_attention_kwargs_from_position_ids(batch, linear_attn_tail_padding_length)
-            # No SP downstream → no sp-pad. Hand the packed batch to the
-            # model-provided hook (if any), which derives ``multimodal_metadata``
-            # from the packed ``*_grid_thw`` tensors using its own config. When
-            # SP is enabled this is deferred to ``SequenceParallelCollator`` so
-            # the hook sees the SP-padded batch + per-modality pad counts.
+            # No SP downstream → no sp-pad for any pixel stream. Hand the
+            # packed batch to the model-provided hook (if any), which derives
+            # ``multimodal_metadata`` from the packed ``*_grid_thw`` tensors
+            # using its own config.
             if self.metadata_collate_func is not None:
-                self.metadata_collate_func(batch, {"pixel_values": 0, "pixel_values_videos": 0})
+                self.metadata_collate_func(
+                    batch, {"pixel_values": 0, "pixel_values_videos": 0, "pixel_values_merged": 0}
+                )
         elif linear_attn_tail_padding_length:
             batch[_LINEAR_ATTN_TAIL_PADDING_LENGTH] = linear_attn_tail_padding_length
         return batch
@@ -337,9 +360,9 @@ class SequenceParallelCollator(DataCollator):
     # Model-provided hook (see ``MetadataCollateFunc``). ``None`` for text
     # models / pipelines without multimodal metadata — then this is a no-op.
     metadata_collate_func: Optional[MetadataCollateFunc] = None
-    # Model-provided hook (see ``PreSPCollateFunc``); runs before SP
-    # padding/slicing. ``None`` -> no-op.
-    pre_sp_collate_func: Optional[PreSPCollateFunc] = None
+    # Model-provided hook (see ``PreSliceCollateFunc``); runs before the
+    # per-key SP pad/slice. ``None`` -> no-op.
+    pre_slice_collate_func: Optional[PreSliceCollateFunc] = None
 
     def __post_init__(self):
         self.sp_size = get_parallel_state().sp_size
@@ -395,11 +418,13 @@ class SequenceParallelCollator(DataCollator):
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 
-        # Model-provided pre-SP hook: runs on the packed, still-global batch so
-        # it can restructure keys (e.g. merge the image and video pixel streams
-        # into ``pixel_values_merged``) before the per-key SP pad/slice below.
-        if self.pre_sp_collate_func is not None:
-            self.pre_sp_collate_func(batch)
+        # Model-provided pre-slice hook: runs on the packed, still-global batch
+        # so it can restructure keys (e.g. merge the image and video pixel
+        # streams into ``pixel_values_merged``) before the per-key SP pad/slice
+        # below. The non-SP counterpart lives in ``PackingCollator``, which is
+        # the last stage when SP is off.
+        if self.pre_slice_collate_func is not None:
+            self.pre_slice_collate_func(batch)
 
         # Track sp_pad sizes for pixel_values{,_videos,_merged} so the ViT
         # metadata ``cu_seqlens`` can be extended with the sp-pad tail entry
@@ -458,7 +483,7 @@ class MainCollator(DataCollator):
     pad_to_length: bool = False
     seq_classification: bool = False
     metadata_collate_func: Optional[MetadataCollateFunc] = None
-    pre_sp_collate_func: Optional[PreSPCollateFunc] = None
+    pre_slice_collate_func: Optional[PreSliceCollateFunc] = None
 
     """
     Data collator pipeline with a unified collate info.
@@ -474,11 +499,13 @@ class MainCollator(DataCollator):
             Optional model-provided hook (``model.get_metadata_collate_func()``)
             that derives ``multimodal_metadata`` from the packed + SP-padded
             batch. ``None`` for text models. See ``MetadataCollateFunc``.
-        pre_sp_collate_func:
-            Optional model-provided hook (``model.get_pre_sp_collate_func()``)
-            that restructures the packed batch before SP padding/slicing
-            (e.g. merging pixel streams). Only used when SP is enabled.
-            ``None`` for models without one. See ``PreSPCollateFunc``.
+        pre_slice_collate_func:
+            Optional model-provided hook (``model.get_pre_slice_collate_func()``)
+            that restructures the packed batch before the per-key SP
+            pad/slice and before ``metadata_collate_func`` (e.g. merging the
+            image and video pixel streams into one). Runs in both SP and non-SP
+            pipelines, exactly once. ``None`` for models without one.
+            See ``PreSliceCollateFunc``.
     """
 
     def __post_init__(self):
@@ -512,6 +539,7 @@ class MainCollator(DataCollator):
                 pad_to_length=self.pad_to_length,
                 seq_classification=self.seq_classification,
                 metadata_collate_func=self.metadata_collate_func,
+                pre_slice_collate_func=self.pre_slice_collate_func,
             )
         )
         if get_parallel_state().sp_enabled:
@@ -520,7 +548,7 @@ class MainCollator(DataCollator):
                     collate_infos=self.collate_infos,
                     seq_classification=self.seq_classification,
                     metadata_collate_func=self.metadata_collate_func,
-                    pre_sp_collate_func=self.pre_sp_collate_func,
+                    pre_slice_collate_func=self.pre_slice_collate_func,
                 )
             )
         logger.info_rank0(self.log_collate_infos())

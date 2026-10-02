@@ -1,17 +1,17 @@
 """Merged image+video vision forward equivalence (exactly-once ViT execution).
 
-With SP disabled, the Qwen VL family Model.forward serves a mixed image+video
-micro-batch with ONE vision-tower call over ``cat(pixel_values,
-pixel_values_videos)`` and splits the feature stream back at
-``pixel_values.shape[0] // spatial_merge_unit`` (see the Patch.7 markers in the
-patch configs and ``.agents/knowledge/multimodal_metadata.md``). This test
+The Qwen VL family serves a mixed image+video micro-batch with ONE
+vision-tower call: the collator merges the two pixel streams into
+``pixel_values_merged`` and Model.forward splits the feature stream back at
+``vit_merged_n_image_rows // spatial_merge_unit`` (see the Patch.7 markers in
+the patch configs and ``.agents/knowledge/multimodal_metadata.md``). This test
 locks the underlying invariant on toy vision towers, CPU-only:
 
 1. the merged call's features match the two per-modality calls (up to GEMM
    batching rounding), including the per-layer deepstack streams;
-2. ``merge_image_video_vit_kwargs`` composed with the collator's
-   ``collate_multimodal_metadata`` reproduces the no-metadata result exactly
-   and builds the expected merged ``cu_seqlens``.
+2. the collator hook pair (``merge_pixel_streams`` then
+   ``collate_multimodal_metadata``) builds the expected merged ``cu_seqlens``
+   and reproduces the no-metadata ViT result exactly.
 """
 
 import os
@@ -130,49 +130,45 @@ def test_merged_vision_forward_matches_split(case):
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c.case_id for c in CASES])
-def test_merge_vit_kwargs_matches_no_metadata_path(case):
+def test_collator_merged_metadata_matches_no_metadata_path(case):
     module, model, vision_config = _build(case)
     image_pixels, image_grid, video_pixels, video_grid = _make_pixels(vision_config)
 
+    # Drive the real collator hooks in pipeline order: the pre-slice merge
+    # replaces the raw streams, then the metadata hook keys off the merged one.
     batch = {
         "pixel_values": image_pixels,
         "image_grid_thw": image_grid,
         "pixel_values_videos": video_pixels,
         "video_grid_thw": video_grid,
     }
+    module.merge_pixel_streams(batch)
+    assert "pixel_values" not in batch and "pixel_values_videos" not in batch
+    merged_pixels = batch["pixel_values_merged"]
+    assert torch.equal(merged_pixels, torch.cat([image_pixels, video_pixels], dim=0))
+
     module.collate_multimodal_metadata(batch, {})
-    metadata = batch["multimodal_metadata"]
-    image_vit_kwargs = {
-        "vit_metadata": {
-            "grid_thw_list": metadata.get("image_grid_thw_list"),
-            "cu_seqlens": metadata.get("vit_image_cu_seqlens"),
-            "max_seqlen": metadata.get("vit_image_max_seqlen"),
-        }
-    }
-    video_vit_kwargs = {
-        "vit_metadata": {
-            "grid_thw_list": metadata.get("video_grid_thw_list"),
-            "cu_seqlens": metadata.get("vit_video_cu_seqlens"),
-            "max_seqlen": metadata.get("vit_video_max_seqlen"),
-        }
-    }
-    merged_kwargs = module.merge_image_video_vit_kwargs(image_vit_kwargs, video_vit_kwargs)
-
-    merged_md = merged_kwargs["vit_metadata"]
-    assert merged_md["grid_thw_list"] == [[1, 2, 2], [2, 2, 2]]
+    merged_md = batch["multimodal_metadata"]
+    assert merged_md["merged_grid_thw_list"] == [[1, 2, 2], [2, 2, 2]]
     # image: one 2x2 frame; video: two 2x2 frames, offset by the image rows.
-    assert merged_md["cu_seqlens"].tolist() == [0, 4, 8, 12]
-    assert merged_md["max_seqlen"] == 4
+    # sp_pad is empty here (SP off), so there is no pad-tail segment.
+    assert merged_md["vit_merged_cu_seqlens"].tolist() == [0, 4, 8, 12]
+    assert merged_md["vit_merged_max_seqlen"] == 4
+    assert merged_md["vit_merged_n_image_rows"] == image_pixels.shape[0]
+    # Merged mode must not also emit the per-modality keys.
+    assert "vit_image_cu_seqlens" not in merged_md and "vit_video_cu_seqlens" not in merged_md
 
-    # Missing metadata on either side must degrade to the ViT's own fallback.
-    assert module.merge_image_video_vit_kwargs(
-        image_vit_kwargs, {"vit_metadata": {"grid_thw_list": None, "cu_seqlens": None, "max_seqlen": None}}
-    ) == {"vit_metadata": {}}
-
-    merged_pixels = torch.cat([image_pixels, video_pixels], dim=0)
+    # Model.forward builds exactly this kwargs dict from the merged metadata.
+    merged_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": merged_md["merged_grid_thw_list"],
+            "cu_seqlens": merged_md["vit_merged_cu_seqlens"],
+            "max_seqlen": merged_md["vit_merged_max_seqlen"],
+        }
+    }
     merged_grid = torch.cat([image_grid, video_grid], dim=0)
     with torch.no_grad():
         out_no_metadata = model(merged_pixels, grid_thw=merged_grid)
-        out_metadata = model(merged_pixels, grid_thw=merged_grid, **merged_kwargs)
+        out_metadata = model(merged_pixels, grid_thw=merged_grid, **merged_vit_kwargs)
 
     assert torch.equal(out_metadata.pooler_output, out_no_metadata.pooler_output)
