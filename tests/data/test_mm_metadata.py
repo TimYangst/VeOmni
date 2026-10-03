@@ -82,7 +82,10 @@ def test_packing_collator_packs_grid_thw_and_invokes_hook():
     )
     # image_grid_thw packed across the batch: (1+2, 3) = 3 image rows.
     assert seen["image_grid_thw"].tolist() == [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
-    assert seen["sp_pad"] == {"pixel_values": 0, "pixel_values_videos": 0}
+    # Every pixel stream the collator knows about reports zero pad here —
+    # including ``pixel_values_merged``, which a model's pre-slice hook may
+    # have produced just above (no SP downstream means no sp-pad either way).
+    assert seen["sp_pad"] == {"pixel_values": 0, "pixel_values_videos": 0, "pixel_values_merged": 0}
     assert batch["multimodal_metadata"] == {"ok": True}
 
 

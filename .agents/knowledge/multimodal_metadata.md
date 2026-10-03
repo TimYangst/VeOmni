@@ -150,6 +150,53 @@ precomputed_max_seqlen = vit_metadata.get("max_seqlen")
 A model whose ViT runs `dummy_forward` (FSDP path for ranks with no real images)
 builds the same `vit_metadata` sub-dict host-side from its Python-int `t/h/w`.
 
+### Merged image+video call (exactly-once vision execution)
+
+Model.forward runs the vision tower **exactly once per rank per step** for the
+Qwen VL family: one merged image+video call, one single-modality call, or one
+`dummy_forward` (FSDP only, when the rank has no vision input).
+
+**The merge happens in the collator, in both SP and non-SP pipelines.** The
+model exposes a second collator hook, `get_pre_slice_collate_func` →
+`merge_pixel_streams`, which replaces `pixel_values` / `pixel_values_videos`
+with a single `pixel_values_merged` stream (image rows first, then video rows;
+the `*_grid_thw` tensors stay). It runs once per batch:
+
+| SP | Invoked by | Layout |
+|----|-----------|--------|
+| on | `SequenceParallelCollator`, before the per-key pad/slice | one sp-pad tail, then sliced per rank |
+| off | `PackingCollator` (the last stage then), before the metadata hook | whole stream, no pad, no slice |
+
+Under SP that placement is *forced*: rank-local slices of two independently
+sliced streams cannot be concatenated afterwards without misordering the
+global vision sequence. With SP off there is no slice to precede, but the hook
+still runs so `Model.forward` has a single merged code path — and the
+concatenation happens in a dataloader worker instead of on the device.
+
+`collate_multimodal_metadata` detects the merged key and emits
+`merged_grid_thw_list` / `vit_merged_cu_seqlens` / `vit_merged_max_seqlen` /
+`vit_merged_n_image_rows` instead of the per-modality keys. `Model.forward`
+runs one ViT call, gathers the feature stream once under SP
+(`gather_outputs(dim=0)`), and splits at
+`vit_merged_n_image_rows // spatial_merge_unit`.
+
+Raw per-modality streams are accepted only when neither SP nor FSDP is on
+(inference, single device), where one call per present modality is free and
+correct. Under SP or FSDP they raise a `ValueError` — wire
+`MainCollator(pre_slice_collate_func=model.get_pre_slice_collate_func())`
+(VeOmni's VLM trainer does this automatically). The two failure modes differ:
+under SP raw streams would be silently *wrong* (misordered vision sequence),
+under FSDP they would make the vision-tower call count data-dependent and
+desync the collectives. SP also requires the
+`veomni_flash_attention_*_with_sp` attention implementations; the sdpa/eager
+fallbacks are not SP-aware.
+
+Coverage: `tests/models/test_vlm_merged_vision_forward.py` (CPU,
+merged==split + the collator hook pair, all 4 models),
+`tests/data/test_pre_slice_merge.py` (CPU, collator merge + metadata, SP on
+and off), `tests/parallel/ulysses/test_vlm_merged_vision_sp.py` (2-GPU SP=2
+end-to-end equivalence).
+
 ## Producer flow (collator pipeline)
 
 ```
@@ -208,11 +255,11 @@ guarantees:
 
 | Model | Status | Notes |
 |---|---|---|
-| qwen3_vl | ✅ wired | Canonical. `collate_multimodal_metadata` helper in the gpu config; npu reuses it. |
-| qwen3_vl_moe | ✅ wired | Reuses qwen3_vl's helper + hook. |
+| qwen3_vl | ✅ wired | Canonical. `add_helper`s the shared `qwen_vl_collate_utils`; npu reuses it. |
+| qwen3_vl_moe | ✅ wired | Reuses qwen3_vl's hook, and the same shared helper. |
 | qwen3_omni_moe | ✅ wired | Same ViT metadata. Also exposes `get_extra_collate_infos` (audio). |
-| qwen3_5 | ✅ wired | Own `collate_multimodal_metadata` (identical formula). |
-| qwen3_5_moe | ✅ wired | Reuses qwen3_5's ViT forward; own `collate_multimodal_metadata`. |
+| qwen3_5 | ✅ wired | `add_helper`s the shared `qwen_vl_collate_utils`. |
+| qwen3_5_moe | ✅ wired | Reuses qwen3_5's ViT forward; same shared helper. |
 | qwen2_vl | ✅ wired | Own `collate_multimodal_metadata` (non-window ViT, same formula as qwen3_vl). |
 | qwen2_5_vl | ✅ wired | Window-attention ViT. `collate_multimodal_metadata` ports `get_window_index` host-side; `get_metadata_collate_func` `partial`-closes the vision-config dims. |
 | qwen2_5_omni | ✅ wired | Same window-attention ViT as qwen2_5_vl. Also exposes `get_extra_collate_infos` (audio); `get_metadata_collate_func` is patched on the thinker, the top-level model delegates. |
@@ -245,14 +292,22 @@ guarantees:
 
 ## Files
 
-- `veomni/data/data_collator.py` — `MainCollator` carries `metadata_collate_func`;
-  `PackingCollator` / `SequenceParallelCollator` invoke it after SP padding.
+- `veomni/data/data_collator.py` — `MainCollator` carries `metadata_collate_func`
+  and `pre_slice_collate_func`; `PackingCollator` / `SequenceParallelCollator`
+  invoke the metadata hook after SP padding and the pre-slice hook before it.
 - `veomni/data/data_transform.py` — transforms emit the `*_grid_thw` tensors +
   `position_ids`.
 - `veomni/trainer/vlm_trainer.py` — `_build_collate_fn` resolves the two model hooks.
+- `veomni/models/transformers/qwen_vl_collate_utils.py` — `collate_multimodal_metadata`
+  and `merge_pixel_streams`, shared by the four Qwen VL families (qwen3_5,
+  qwen3_5_moe, qwen3_vl, qwen3_vl_moe). Model-agnostic by construction: helpers
+  are emitted verbatim and bypass patchgen's `name_map`, so a model-specific
+  symbol here would land unrenamed in every other family's generated file.
 - `veomni/models/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
-  `collate_multimodal_metadata` helper + `get_metadata_collate_func` /
-  `get_extra_collate_infos` overrides; regenerated `generated/` files.
+  `collate_multimodal_metadata` helper (the four Qwen VL families `add_helper`
+  the shared one above; the others define their own) + `get_metadata_collate_func`
+  / `get_pre_slice_collate_func` / `get_extra_collate_infos` overrides;
+  regenerated `generated/` files.
 - `tests/data/test_mm_metadata.py` — collator-hook handoff + hook picklability.
 - `tests/models/test_model_forward_no_implicit_sync.py` — sync gate; feeds synthetic
   `multimodal_metadata` for the wired cases.

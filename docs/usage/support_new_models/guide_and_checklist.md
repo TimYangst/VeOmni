@@ -190,6 +190,17 @@ For implementation details of each patch, refer to the example docs.
 
 ### VLMs (image/video)
 
+> **Qwen VL family exception.** `qwen3_5`, `qwen3_5_moe`, `qwen3_vl` and
+> `qwen3_vl_moe` no longer use the per-modality two-slot layout described
+> below (an image slot and a video slot, each a real call or a dummy). They
+> run the vision tower exactly once per rank per step over a single
+> collator-merged `pixel_values_merged` stream, and reject raw per-modality
+> streams once SP or FSDP is on. If you are adding a sibling of those models,
+> follow `.agents/knowledge/constraints.md` #16 and
+> `.agents/knowledge/multimodal_metadata.md` instead of this checklist's
+> dummy-per-modality pattern. Other VLMs and the omni models still use the
+> layout below.
+
 - [ ] FSDP `dummy_forward` in ViT encoder
 - [ ] SP `sp_pad_and_slice` in ViT (correct `pad_scale`)
 - [ ] SP `cu_seqlens` padding entry

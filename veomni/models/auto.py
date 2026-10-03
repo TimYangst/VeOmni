@@ -299,6 +299,19 @@ def build_foundation_model(
     check_context_parallel_supported(config)
     check_model_build_prerequisites(config)
 
+    # NOTE: ``config.encoder_data_balance`` is written here but read nowhere —
+    # no patchgen config, no generated modeling, and nothing imports
+    # ``veomni/utils/data_balance/`` outside its own test. The flag is inert
+    # today, so the branches below only pick which value gets stored.
+    #
+    # Reviving it needs more than flipping the flag back on: the balance
+    # helpers in ``veomni/utils/data_balance/data_balance.py`` take one
+    # per-modality pixel stream (``pixel_values`` + ``image_grid_thw``), and
+    # qwen3_vl_moe — the only model this flag claims to support — now receives
+    # a single merged image+video stream from the collator whenever SP or FSDP
+    # is on (see ``.agents/knowledge/constraints.md`` #16). The sp_enabled
+    # carve-out below is therefore too narrow: FSDP alone is enough to change
+    # the layout the helpers would have to balance.
     if encoder_data_balance:
         if config.model_type == "qwen3_vl_moe":
             if get_parallel_state().sp_enabled:

@@ -398,7 +398,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
 }
 
 
-def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
+def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict, *, merged: bool = False) -> None:
     """Inject ``multimodal_metadata`` by running the model's real collate hook.
 
     Calls ``model.get_metadata_collate_func()`` — the exact picklable hook the
@@ -407,6 +407,23 @@ def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
     production would, and the precompute consumer path is exercised with the
     real per-model metadata derivation rather than a test reimplementation
     (which would be circular — a bug shared by both would pass silently).
+
+    With ``merged=True``, a model that also exposes
+    ``get_pre_slice_collate_func`` (the Qwen VL family) has its raw
+    ``pixel_values`` / ``pixel_values_videos`` replaced by the single merged
+    stream that hook produces — the layout it receives in real training, since
+    ``VLMTrainer`` always wires the hook and the forward requires the merged
+    stream once SP or FSDP is on. That branch splits the feature stream using
+    ``vit_merged_n_image_rows`` from the metadata instead of syncing on the
+    grid tensor, so it is the one worth holding the sync ratchet against.
+
+    ``merged`` stays off by default because the equivalence test below asserts
+    *bitwise* parity between the metadata path and the in-forward fallback:
+    both must stay the same computation, differing only in where the ViT
+    metadata came from. Merging changes the computation itself (one ViT call
+    over the concatenated streams instead of two), which is equal only up to
+    GEMM-batching rounding — that equivalence is gated separately, on CPU, by
+    ``tests/models/test_vlm_merged_vision_forward.py``.
 
     No-op for cases not in ``_MM_METADATA_WIRED_CASES`` or models without the
     hook. The toy test has no SP, so the sp-pad counts are zero.
@@ -422,7 +439,20 @@ def _attach_multimodal_metadata(model, case: Case, fwd_kwargs: dict) -> None:
     batch = {k: fwd_kwargs[k] for k in ("image_grid_thw", "video_grid_thw") if k in fwd_kwargs}
     if not batch:
         return
-    hook(batch, {"pixel_values": 0, "pixel_values_videos": 0})
+
+    get_merge_hook = getattr(model, "get_pre_slice_collate_func", None) if merged else None
+    merge_hook = get_merge_hook() if get_merge_hook is not None else None
+    if merge_hook is not None:
+        for key in ("pixel_values", "pixel_values_videos"):
+            if key in fwd_kwargs:
+                batch[key] = fwd_kwargs[key]
+        merge_hook(batch)
+        if "pixel_values_merged" in batch:
+            for key in ("pixel_values", "pixel_values_videos"):
+                fwd_kwargs.pop(key, None)
+            fwd_kwargs["pixel_values_merged"] = batch["pixel_values_merged"]
+
+    hook(batch, {"pixel_values": 0, "pixel_values_videos": 0, "pixel_values_merged": 0})
     md = batch.get("multimodal_metadata")
     if md is not None:
         fwd_kwargs["multimodal_metadata"] = md
@@ -626,7 +656,7 @@ def test_no_implicit_sync_in_generated_forward(case):
     # .agents/knowledge/multimodal_metadata.md. Cases that opt in here have
     # their ViT-side fallback syncs removed from the allowlist below; cases
     # not yet wired keep the fallback entries in ``_ALLOWED_SYNCS``.
-    _attach_multimodal_metadata(model, case, fwd_kwargs)
+    _attach_multimodal_metadata(model, case, fwd_kwargs, merged=True)
 
     # Warmup outside debug mode: rotary cos/sin cache fill, kernel
     # autotuning, lazy buffer materialisation — these fire once and

@@ -29,7 +29,7 @@ _VOCAB_SIZE = 1024
 # ---------------------------------------------------------------------------
 
 
-def _vlm_batch(*, rank, device, dtype, patch_size):
+def _vlm_batch(*, rank, device, dtype, patch_size, merged_vision=False):
     """Build VLM batch: rank 0 gets images + video, other ranks get text-only."""
     h, w = 4, 4
     image_t, video_t = 2, 10
@@ -48,7 +48,7 @@ def _vlm_batch(*, rank, device, dtype, patch_size):
         video_mask = mask.clone()
         video_mask[0, -video_seqlen:] = True
 
-        return {
+        batch = {
             "input_ids": torch.randint(0, _VOCAB_SIZE, (1, seq_len), device=device),
             "attention_mask": torch.ones(1, seq_len, dtype=torch.long, device=device),
             "labels": torch.randint(0, _VOCAB_SIZE, (1, seq_len), device=device),
@@ -59,6 +59,19 @@ def _vlm_batch(*, rank, device, dtype, patch_size):
             "image_grid_thw": torch.tensor([[1, h, w]] * image_t, dtype=torch.long, device=device),
             "video_grid_thw": torch.tensor([[video_t, h, w]], dtype=torch.long, device=device),
         }
+        if merged_vision:
+            # The Qwen3-VL family requires the collator-merged vision stream
+            # once FSDP is on (constraints.md #16), so run the same two hooks
+            # the collator would instead of hand-rolling the merged layout.
+            # sp_pad is empty: this test shards with FSDP2 but no SP.
+            from veomni.models.transformers.qwen_vl_collate_utils import (
+                collate_multimodal_metadata,
+                merge_pixel_streams,
+            )
+
+            merge_pixel_streams(batch)
+            collate_multimodal_metadata(batch, {})
+        return batch
     else:
         return {
             "input_ids": torch.randint(0, _VOCAB_SIZE, (1, _TEXT_SEQ_LEN), device=device),
@@ -208,13 +221,13 @@ _vlm_cases = [
     pytest.param(
         "qwen3_vl",
         "./tests/toy_config/qwen3vl_toy",
-        partial(_vlm_batch, patch_size=16),
+        partial(_vlm_batch, patch_size=16, merged_vision=True),
         id="qwen3_vl",
     ),
     pytest.param(
         "qwen3_vl_moe",
         "./tests/toy_config/qwen3vlmoe_toy",
-        partial(_vlm_batch, patch_size=16),
+        partial(_vlm_batch, patch_size=16, merged_vision=True),
         id="qwen3_vl_moe",
     ),
 ]

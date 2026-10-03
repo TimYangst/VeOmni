@@ -155,13 +155,32 @@ Core files:
     - Audio: `librosa` at configurable `sample_rate` (default 16kHz).
     - Placeholder IDs: `veomni/utils/constants.py` defines the negative placeholders (`IMAGE_INPUT_INDEX = -200`, `VIDEO_INPUT_INDEX = -300`, `AUDIO_INPUT_INDEX = -400`; `TYPE2INDEX` groups them by input/output). `MultimodalChatTemplate` writes them into `input_ids`, and `process_sample_qwen_vl()` derives `image_mask` / `video_mask` from them, then zeroes the placeholders before text embedding. `process_sample_qwen_omni()` instead derives `image_mask` / `video_mask` / `audio_mask` from the model's own multimodal token ids. The mask keys are `{modality}_mask` — the V1 `{modality}_{input|output}_mask` convention went away with the SeedOmni V1 stack.
 
+16. **Qwen VL family under SP or FSDP requires the collator-merged vision stream**
+    - qwen3_5 / qwen3_5_moe / qwen3_vl / qwen3_vl_moe forwards accept only
+      `pixel_values_merged` once SP or FSDP is on, and raise on raw
+      `pixel_values` / `pixel_values_videos`. It is produced by the model's
+      `get_pre_slice_collate_func` hook, which the collator runs on the packed
+      global batch — inside `SequenceParallelCollator` before the per-key SP
+      pad/slice, or inside `PackingCollator` when SP is off.
+    - The hook runs in both modes on purpose, so the forward has one merged
+      code path. Merging *after* the per-key SP slice is unfixable: rank-local
+      slices of two independently-sliced streams cannot be concatenated
+      without misordering the global vision sequence.
+    - Raw streams stay legal without SP and FSDP (inference, single device).
+      The two rejections have different causes: under SP raw streams are
+      silently wrong, under FSDP they make the vision-tower call count
+      data-dependent and desync the collectives.
+    - This keeps the vision tower at exactly ONE execution per rank per step
+      (merged / single-modality / dummy), which FSDP collective alignment
+      depends on. See `.agents/knowledge/multimodal_metadata.md`.
+
 ## Checkpoint
 
-16. **DCP checkpoint keys must match model state dict**
+17. **DCP checkpoint keys must match model state dict**
     - `veomni/checkpoint/dcp_checkpointer.py` uses PyTorch's DCP (`torch.distributed.checkpoint`).
     - Renaming model parameters or changing the model structure between save and load breaks checkpoint loading.
 
-17. **Checkpoint save/load requires all ranks to participate**
+18. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
     - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
@@ -177,7 +196,7 @@ Core files:
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 
-18. **Distributed HF safetensors consolidation must support non-floating tensors**
+19. **Distributed HF safetensors consolidation must support non-floating tensors**
     - PyTorch 2.9–2.11 computes consolidated tensor byte sizes with `torch.finfo`, which crashes for valid integer and boolean buffers such as DeepSeek V4 `tid2eid`.
     - `apply_dcp_consolidation_patch()` in `veomni/checkpoint/dcp_consolidation.py` replaces the metadata parser with `Tensor.element_size()` and verifies the upstream private-function source hash before patching.
     - Offline DCP-to-HF conversion may cast `save_dtype` only onto floating tensors; integer and boolean buffers must retain their original dtype, and shard-size planning must use their original element sizes.
@@ -185,39 +204,39 @@ Core files:
 
 ## Code Quality
 
-19. **Ruff must pass before commit**
+20. **Ruff must pass before commit**
     - `make quality` runs `ruff check` and `ruff format --check`.
     - Pre-commit hooks enforce this automatically (`pre-commit run --all-files`).
 
-20. **All comments and docstrings must be in English**
+21. **All comments and docstrings must be in English**
     - No Chinese or other non-English text in code comments. This is enforced by project convention.
 
-21. **PR title must follow format: `[{modules}] {type}: {description}`**
+22. **PR title must follow format: `[{modules}] {type}: {description}`**
     - Allowed modules and types are defined in `.github/workflows/check_pr_title.yml` (single source of truth).
     - CI checks PR titles automatically on every PR.
 
 ## Hardware
 
-22. **Non-CUDA accelerator code paths require guards**
+23. **Non-CUDA accelerator code paths require guards**
     - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
     - NPU kernels live in `veomni/ops/kernels/{rms_norm,rotary}/npu.py` and `veomni/ops/platform/npu/`; the MLU kernel is `veomni/ops/kernels/moe/mlu_group_gemm.py`. They must not be imported on a host without that vendor's runtime.
     - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
-23. **Device-agnostic code must use `veomni.utils.device` helpers**
+24. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU and MLU compatibility.
 
 ## Trainer Extensions
 
-24. **Trainer callback lifecycle changes must cover composed trainers**
+25. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
+26. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
 
-26. **DCP full resume skips HF weight materialization**
+27. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `should_skip_hf_weight_load=True` into `build_parallelize_model`, which forwards it to `parallelize_model_fsdp2` / `parallelize_model_ddp`.
     - The model is materialized without an HF weight read; parameters are restored by DCP in `CheckpointCallback.on_train_begin`.
     - Materialize through `_to_empty_preserving_nonpersistent_buffers()`, never bare `to_empty()`, on the random-init path as much as the resume path. `init_empty_weights()` patches `register_parameter` only, so a meta-built model holds *real* buffer values and `to_empty()` swaps every one for uninitialized memory. What restores them is narrower than it looks: DCP saves `state_dict()`, which omits `persistent=False`, and HF's `_init_weights` recomputes a rope table only for a module exposing `original_inv_freq` — which leaves Gemma3's per-layer-type `{type}_inv_freq`, its `embed_scale` and the Omni audio tower's sinusoidal `positional_embedding` with nothing behind them. A buffer built from a parameter is itself on meta, has no data to copy out of, and is skipped with a warning; no model registers one today. Note `veomni/models/module_utils.py` has the same unguarded pattern on the HF-load path.
@@ -226,12 +245,12 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
+28. **Exact uv synchronization removes separately installed overlays**
     - MagiAttention itself is the optional `--extra magi` extra (`uv sync --extra gpu --extra magi`).
       The SM90 CUTLASS overlay is then installed by `scripts/kernel/install_magi_sm90.sh`.
       Reinstall the overlay after a later exact `uv sync` before running MagiAttention on SM90.
 
-28. **In-place collective reductions in backward must own their gradient buffer**
+29. **In-place collective reductions in backward must own their gradient buffer**
     - Autograd can pass the same incoming gradient to multiple branches. `.contiguous()` does not copy an already contiguous tensor, so reducing that tensor in place can silently change a sibling branch's gradient and the caller's `grad_outputs`.
     - `_Gather.backward` uses NCCL reduce-scatter for nonempty real gradients with positive shard sizes. Equal shards use rank-major stacked tensor input to avoid the list API's internal flatten; uneven shards use the list path. Borrowed inputs require a separate output. Owned packed inputs may reuse the local rank's slice only where the old contiguous all-reduce result would also retain full storage; otherwise keep compact local storage. This avoids adding a local output allocation on top of a required full packing buffer. Other backends and complex/empty inputs retain an owned contiguous all-reduce buffer. `_GatherConcatSP.backward` also owns its in-place reduction buffer.
     - Collective selection must agree across ranks: negative-view flags and strides may differ by rank, so materialize them locally without changing the chosen collective. Preserve scaling before summation (FP16 overflow makes the order observable). The no-sum path scales only the local slice. Regression tests in `tests/parallel/ulysses/test_all_gather.py` cover shared gradients, edge cases, and local output storage with real Gloo/NCCL collectives where available.
